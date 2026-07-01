@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+faiss-cpu
+insightface
+uniface
+onnxruntime
+opencv-python
+tabulate
+matplotlib
+pynvml
+torch
+torchvision
+torchaudio
