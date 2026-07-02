@@ -61,6 +61,8 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 
 def get_gpu_mem_mb(handle) -> float:
+    if handle is None:
+        return 0.0
     return pynvml.nvmlDeviceGetMemoryInfo(handle).used / (1024 ** 2)
 
 
@@ -124,9 +126,14 @@ def evaluate_engine(engine_name: str, known: dict, unknown: list, handle) -> dic
     reset_engine_data(engine_name)
     store = FaceStore(engine_name=engine_name)
 
+    # --- Warmup: run once on the first available enroll image, discard result ---
+    first_person = next(iter(known.values()))
+    warmup_img = cv2.imread(first_person["enroll"][0])
+    if warmup_img is not None:
+        _ = engine.embed(warmup_img)
+
     # --- Enrollment ---
     enroll_times = []
-    warmed_up = False
     for person, data in known.items():
         for path in data["enroll"]:
             image = cv2.imread(path)
@@ -135,10 +142,6 @@ def evaluate_engine(engine_name: str, known: dict, unknown: list, handle) -> dic
                 continue
 
             embedding, detect_ms, embed_ms = engine.embed(image)
-            if not warmed_up:
-                warmed_up = True
-                print(f"  [enroll] {person}/{os.path.basename(path)}: warmup (discarded)")
-                continue
             if embedding is None:
                 print(f"  [enroll] {person}/{os.path.basename(path)}: no face detected, skipping")
                 continue
@@ -263,8 +266,12 @@ def main():
                          help=f"Which engines to evaluate (default: all of {list(ENGINES.keys())})")
     args = parser.parse_args()
 
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        print("No GPU detected (pynvml init failed) -- running on CPU, GPU memory will show as 0.")
+        handle = None
 
     known, unknown = collect_dataset(args.test_dir)
     print("Known people (enroll/probe split):",
