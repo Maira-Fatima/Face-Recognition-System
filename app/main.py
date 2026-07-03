@@ -1,12 +1,16 @@
+import os
+import uuid
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import numpy as np
 import cv2
 import time
 
 from app.config import settings
-from app.engine import get_engine, ENGINES
-from app.storage import FaceStore
+from app.engine import get_engine, ENGINES, get_scene_engine
+from app.storage import FaceStore, SceneStore
 
 app = FastAPI(title="Face Recognition API")
 
@@ -16,15 +20,38 @@ app = FastAPI(title="Face Recognition API")
 engines: dict = {}
 stores: dict = {}
 
+# Scene/location recognition -- a single shared engine + store, since
+# (unlike faces) there's only one embedding model in play here.
+scene_engine = None
+scene_store: SceneStore = None
+
+# Serve saved scene photos back over HTTP so /search_scene results are
+# directly viewable, e.g. http://localhost:8000/scene_images/<file>.jpg
+app.mount("/scene_images", StaticFiles(directory=settings.SCENE_IMAGE_DIR), name="scene_images")
+
 
 @app.on_event("startup")
 async def startup_event():
-    global engines, stores
+    global engines, stores, scene_engine, scene_store
     for engine_name in ENGINES.keys():
         print(f"Loading engine: {engine_name}...")
         engines[engine_name] = get_engine(engine_name)
         stores[engine_name] = FaceStore(engine_name=engine_name)
-    print(f"Startup complete. Loaded engines: {list(engines.keys())}")
+
+    print("Loading scene engine (YOLOv8-seg + DINOv2)...")
+    scene_engine = get_scene_engine()
+    scene_store = SceneStore()
+
+    print(f"Startup complete. Loaded engines: {list(engines.keys())} + scene engine")
+
+
+def _save_scene_image(image: np.ndarray) -> str:
+    """Saves the original (unmasked) photo to disk so it can be returned
+    later as 'the matching photo' on a scene search hit."""
+    filename = f"{uuid.uuid4().hex}.jpg"
+    filepath = os.path.join(settings.SCENE_IMAGE_DIR, filename)
+    cv2.imwrite(filepath, image)
+    return filepath
 
 
 async def _process_image(file: UploadFile) -> np.ndarray:
@@ -47,6 +74,8 @@ def health_check():
         "total_faces_stored": {
             name: store.get_total_faces() for name, store in stores.items()
         },
+        "scene_engine_loaded": scene_engine is not None,
+        "total_scenes_stored": scene_store.get_total_scenes() if scene_store else 0,
     }
 
 
@@ -94,9 +123,31 @@ async def insert_face(
             detail="No face detected in the image by any engine",
         )
 
+    # --- Scene/location pipeline ---
+    # Only runs because a face was already confirmed present above -- this
+    # is how we enforce "there must be a person in the picture" for scene
+    # enrollment without needing a separate face check inside SceneEngine.
+    scene_result = None
+    try:
+        scene_embedding, mask_ms, scene_embed_ms = scene_engine.embed(image)
+        saved_path = _save_scene_image(image)
+        scene_id = scene_store.insert(
+            embedding=scene_embedding, image_path=saved_path, person_name=name
+        )
+        scene_result = {
+            "success": True,
+            "scene_id": scene_id,
+            "image_path": saved_path,
+            "mask_ms": round(mask_ms, 2),
+            "embed_ms": round(scene_embed_ms, 2),
+        }
+    except Exception as e:
+        scene_result = {"success": False, "error": str(e)}
+
     return {
         "name": name,
         "results_by_engine": results,
+        "scene": scene_result,
     }
 
 
@@ -211,4 +262,68 @@ async def search_face_all_engines(
     return {
         "match_threshold": settings.MATCH_THRESHOLD,
         "results_by_engine": results,
+    }
+
+
+@app.post("/search_scene")
+async def search_scene(
+    file: UploadFile = File(...),
+    top_k: int = Form(3),
+    face_check_engine: str = Form(
+        default=settings.DEFAULT_ENGINE,
+        description="Which face engine to use just to confirm a person is present.",
+    ),
+):
+    """
+    Scene/location search: 'have I seen this background before, even with
+    a different person in front of it?'
+
+    A face must still be detected in the query photo (same rule as
+    /insert) -- but the actual MATCH is done purely on the background,
+    ignoring who the person is. On a hit, returns the ORIGINAL stored
+    photo (via image_path / the /scene_images static URL), not a location
+    name -- there is no location label anywhere in this system.
+    """
+    if face_check_engine not in engines:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown engine '{face_check_engine}'. Available: {list(engines.keys())}",
+        )
+
+    try:
+        image = await _process_image(file)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Gate: require a person in the query photo too, same as /insert.
+    face_embedding, detect_ms, _ = engines[face_check_engine].embed(image)
+    if face_embedding is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No face detected in the query image -- a person must be present.",
+        )
+
+    start = time.perf_counter()
+    scene_embedding, mask_ms, embed_ms = scene_engine.embed(image)
+    matches = scene_store.search(embedding=scene_embedding, top_k=top_k)
+    total_ms = (time.perf_counter() - start) * 1000.0
+
+    # Attach a browsable URL for each match's stored photo.
+    for m in matches:
+        filename = os.path.basename(m["image_path"])
+        m["image_url"] = f"/scene_images/{filename}"
+
+    best_match = None
+    if matches and matches[0]["similarity"] >= settings.SCENE_MATCH_THRESHOLD:
+        best_match = matches[0]
+
+    return {
+        "location_recognized": best_match is not None,
+        "best_match": best_match,
+        "matches": matches,
+        "match_threshold": settings.SCENE_MATCH_THRESHOLD,
+        "face_detect_ms": round(detect_ms, 2),
+        "mask_ms": round(mask_ms, 2),
+        "embed_ms": round(embed_ms, 2),
+        "total_ms": round(total_ms, 2),
     }

@@ -12,3 +12,4 @@ pynvml
 torch
 torchvision
 torchaudio
+ultralytics

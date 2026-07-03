@@ -1,3 +1,10 @@
 venv/
 __pycache__/
 *.pyc
+
+# generated data — indexes, sqlite db, saved photos, downloaded model weights
+data/*.bin
+data/*.sqlite
+data/scene_images/
+*.pt
+.env

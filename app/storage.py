@@ -131,3 +131,109 @@ class FaceStore:
 
     def get_total_faces(self):
         return self.index.ntotal
+
+
+class SceneStore:
+    """
+    Manages the FAISS index + SQLite table for scene/location embeddings.
+    Mirrors FaceStore's structure, but there is no 'name' concept -- a
+    scene entry is retrieval-only: "have I seen this background before,
+    and if so, here's the photo". No location label is required or stored.
+    """
+    def __init__(self):
+        self.db_path = settings.SCENE_DB_PATH
+        self.faiss_index_path = settings.SCENE_FAISS_INDEX_PATH
+        self.dim = settings.SCENE_EMBEDDING_DIM
+
+        self._init_sqlite()
+        self._init_faiss()
+
+    def _init_sqlite(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scenes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_path TEXT NOT NULL,
+                    person_name TEXT,
+                    inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def _init_faiss(self):
+        if os.path.exists(self.faiss_index_path):
+            self.index = faiss.read_index(self.faiss_index_path)
+        else:
+            base_index = faiss.IndexFlatIP(self.dim)
+            self.index = faiss.IndexIDMap(base_index)
+
+    def _save_faiss(self):
+        faiss.write_index(self.index, self.faiss_index_path)
+
+    def insert(self, embedding: np.ndarray, image_path: str, person_name: str = None) -> int:
+        """
+        Inserts a scene embedding + the saved image path into the store.
+
+        Args:
+            embedding (np.ndarray): the scene embedding (shape (dim,) or (1, dim)).
+            image_path (str): where the original (or person-masked) photo was saved on disk.
+            person_name (str, optional): whoever was enrolled in this same photo,
+                if known -- purely informational, never used for matching.
+
+        Returns:
+            int: the inserted record ID.
+        """
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(1, self.dim)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO scenes (image_path, person_name) VALUES (?, ?)",
+                (image_path, person_name)
+            )
+            record_id = cursor.lastrowid
+            conn.commit()
+
+        ids = np.array([record_id], dtype=np.int64)
+        self.index.add_with_ids(embedding, ids)
+        self._save_faiss()
+
+        return record_id
+
+    def search(self, embedding: np.ndarray, top_k: int = 5):
+        """
+        Searches for the top-k most similar scenes/locations.
+
+        Returns:
+            list of dicts: id, image_path, person_name, similarity.
+        """
+        if self.index.ntotal == 0:
+            return []
+
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(1, self.dim)
+
+        distances, ids = self.index.search(embedding, top_k)
+
+        results = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            for dist, record_id in zip(distances[0], ids[0]):
+                if record_id == -1:
+                    continue
+                cursor.execute(
+                    "SELECT id, image_path, person_name FROM scenes WHERE id = ?", (int(record_id),)
+                )
+                row = cursor.fetchone()
+                if row:
+                    results.append({
+                        "id": row[0],
+                        "image_path": row[1],
+                        "person_name": row[2],
+                        "similarity": float(dist)
+                    })
+
+        return results
+
+    def get_total_scenes(self):
+        return self.index.ntotal

@@ -7,6 +7,8 @@ from insightface.app import FaceAnalysis
 from uniface.detection import RetinaFace
 from uniface.recognition import AdaFace, EdgeFace
 
+from app.config import settings
+
 class BaseEngine(ABC):
     """
     Abstract base class for all face recognition engines.
@@ -137,3 +139,96 @@ def get_engine(engine_name: str) -> BaseEngine:
     if engine_name not in ENGINES:
         raise ValueError(f"Engine {engine_name} not found. Available engines: {list(ENGINES.keys())}")
     return ENGINES[engine_name]()
+
+
+class SceneEngine:
+    """
+    Generates an embedding of the LOCATION/BACKGROUND in an image, with any
+    people masked out first. This is intentionally separate from BaseEngine:
+    it is not identifying a person, it is identifying a place, and the
+    caller (main.py) is responsible for making sure a face was detected
+    before this engine is ever invoked -- that's how we enforce "a person
+    must be present in the photo" without baking a face-detector into a
+    scene/background model.
+
+    Pipeline: YOLOv8-seg (mask out every 'person' instance) -> DINOv2
+    (embed the person-less background) -> L2-normalized 768-dim vector,
+    stored/searched via cosine similarity, exactly like the face engines.
+    """
+
+    def __init__(self):
+        from ultralytics import YOLO
+        from torchvision import transforms
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Person segmentation model (COCO class 0 = 'person')
+        self.segmenter = YOLO(settings.YOLO_SEG_MODEL)
+
+        # Frozen, pretrained DINOv2 -- no fine-tuning, used purely for
+        # embedding + nearest-neighbour retrieval (same philosophy as
+        # ArcFace/AdaFace/EdgeFace being used pretrained, not trained here).
+        self.model = torch.hub.load("facebookresearch/dinov2", settings.DINOV2_MODEL_NAME)
+        self.model.to(self.device).eval()
+
+        self._transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def _mask_out_people(self, image_bgr: np.ndarray) -> np.ndarray:
+        """Blacks out every detected person instance so only background remains."""
+        results = self.segmenter(image_bgr, classes=[0], verbose=False)  # class 0 = person
+        masked = image_bgr.copy()
+
+        if results and results[0].masks is not None:
+            h, w = masked.shape[:2]
+            for mask in results[0].masks.data:
+                mask_np = mask.cpu().numpy().astype(np.uint8)
+                mask_resized = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                masked[mask_resized] = 0
+
+        return masked
+
+    def embed(self, image_bgr: np.ndarray):
+        """
+        Masks out people, then embeds the remaining background with DINOv2.
+
+        Args:
+            image_bgr (np.ndarray): input image, BGR (same convention as
+                the face engines / cv2.imdecode output).
+
+        Returns:
+            tuple: (embedding, mask_ms, embed_ms)
+                embedding: np.ndarray of shape (768,), L2-normalized.
+                mask_ms: float, time spent on person segmentation.
+                embed_ms: float, time spent on DINOv2 embedding.
+        """
+        start_mask = time.perf_counter()
+        masked_bgr = self._mask_out_people(image_bgr)
+        mask_ms = (time.perf_counter() - start_mask) * 1000.0
+
+        start_embed = time.perf_counter()
+        from PIL import Image
+        rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
+        tensor = self._transform(pil_image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            embedding = self.model(tensor)
+            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        embed_ms = (time.perf_counter() - start_embed) * 1000.0
+
+        embedding = embedding.cpu().numpy().flatten().astype(np.float32)
+        return embedding, mask_ms, embed_ms
+
+
+_scene_engine_singleton: "SceneEngine | None" = None
+
+
+def get_scene_engine() -> SceneEngine:
+    """Lazily builds and caches a single SceneEngine (mirrors get_engine() for face engines)."""
+    global _scene_engine_singleton
+    if _scene_engine_singleton is None:
+        _scene_engine_singleton = SceneEngine()
+    return _scene_engine_singleton
