@@ -42,25 +42,36 @@ import cv2                                # noqa: E402
 
 
 def load_all_embeddings():
-    index = faiss.read_index(settings.SCENE_FAISS_INDEX_PATH)
-    n = index.ntotal
-    if n == 0:
-        return None, None, []
-    # IndexIDMap wraps IndexFlatIP; reconstruct_n gives back stored vectors
-    xb = np.zeros((n, settings.SCENE_EMBEDDING_DIM), dtype=np.float32)
-    ids = []
+    """
+    Recomputes embeddings directly from the saved images rather than
+    calling index.reconstruct() -- IndexIDMap wrapping IndexFlatIP does
+    not reliably support reconstruct() when using custom (non-sequential)
+    IDs like our SQLite record IDs, across faiss-cpu builds. Recomputing
+    is a bit slower but has no such dependency.
+    """
     conn = sqlite3.connect(settings.SCENE_DB_PATH)
-    cursor = conn.execute("SELECT id, image_path FROM scenes ORDER BY id")
-    rows = cursor.fetchall()
+    rows = conn.execute("SELECT id, image_path FROM scenes ORDER BY id").fetchall()
     conn.close()
-    id_to_path = {r[0]: r[1] for r in rows}
 
-    # Rebuild ordered by the FAISS-assigned ids (which are the sqlite ids)
-    all_ids = list(id_to_path.keys())
-    for i, rid in enumerate(all_ids):
-        xb[i] = index.reconstruct(rid)
-        ids.append(rid)
+    if not rows:
+        return None, None, {}
 
+    scene_engine = get_scene_engine()
+    id_to_path = {}
+    embeddings = []
+    ids = []
+
+    for record_id, image_path in rows:
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"warning: could not read {image_path}, skipping")
+            continue
+        emb, _, _ = scene_engine.embed(image)
+        embeddings.append(emb)
+        ids.append(record_id)
+        id_to_path[record_id] = image_path
+
+    xb = np.vstack(embeddings).astype(np.float32)
     return xb, ids, id_to_path
 
 
