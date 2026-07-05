@@ -237,3 +237,42 @@ class SceneStore:
 
     def get_total_scenes(self):
         return self.index.ntotal
+
+    def search_multi(self, embeddings: list, top_k: int = 5):
+        """
+        Searches with SEVERAL query embeddings of the same photo (e.g. from
+        SceneEngine.embed_multi_view) and merges the results: for each
+        gallery item that shows up under ANY view, keep the highest
+        similarity score seen across all views, then return the top_k
+        merged results sorted by that score.
+
+        This is what gives robustness to partial/cropped query photos --
+        if only one of the 3 views happens to align well with a gallery
+        embedding, that view's score still wins instead of being averaged
+        away or missed entirely.
+
+        Args:
+            embeddings (list[np.ndarray]): one or more query embeddings.
+            top_k (int): number of merged results to return.
+
+        Returns:
+            list of dicts: id, image_path, person_name, similarity
+                (the BEST similarity seen for that id across all views).
+        """
+        if self.index.ntotal == 0 or not embeddings:
+            return []
+
+        best_by_id = {}
+        # Search a generous number of candidates per view so a true match
+        # that only shows up strongly under one view isn't cut off early.
+        per_view_k = max(top_k, 10)
+
+        for embedding in embeddings:
+            per_view_results = self.search(embedding, top_k=per_view_k)
+            for r in per_view_results:
+                rid = r["id"]
+                if rid not in best_by_id or r["similarity"] > best_by_id[rid]["similarity"]:
+                    best_by_id[rid] = r
+
+        merged = sorted(best_by_id.values(), key=lambda r: -r["similarity"])
+        return merged[:top_k]

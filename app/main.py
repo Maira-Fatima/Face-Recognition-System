@@ -313,8 +313,10 @@ async def _run_scene_search(image: np.ndarray, top_k: int, face_check_engine: st
         )
 
     start = time.perf_counter()
-    scene_embedding, mask_ms, embed_ms = scene_engine.embed(image)
-    matches = scene_store.search(embedding=scene_embedding, top_k=top_k)
+    views, mask_ms, embed_ms = scene_engine.embed_multi_view(image)
+    matches = scene_store.search_multi(
+        embeddings=[v["embedding"] for v in views], top_k=top_k
+    )
     total_ms = (time.perf_counter() - start) * 1000.0
 
     for m in matches:

@@ -18,6 +18,11 @@ same philosophy as scripts/benchmark.py.
 Usage:
     python scripts/populate_scene_gallery.py --source-dir scene_dataset
     python scripts/populate_scene_gallery.py --source-dir scene_dataset --face-engine arcface
+
+    # Rebuild from scratch (needed any time SceneEngine's preprocessing
+    # changes, since old embeddings would no longer be comparable to new
+    # query embeddings):
+    python scripts/populate_scene_gallery.py --source-dir scene_dataset --reset
 """
 
 import os
@@ -38,12 +43,40 @@ from app.storage import SceneStore        # noqa: E402
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
 
 
+def reset_gallery():
+    """Deletes the existing scene FAISS index, scene DB rows, and saved
+    scene photos, so populate can rebuild the gallery from a clean state."""
+    import sqlite3
+
+    if os.path.exists(settings.SCENE_FAISS_INDEX_PATH):
+        os.remove(settings.SCENE_FAISS_INDEX_PATH)
+        print(f"Deleted {settings.SCENE_FAISS_INDEX_PATH}")
+
+    if os.path.exists(settings.SCENE_DB_PATH):
+        with sqlite3.connect(settings.SCENE_DB_PATH) as conn:
+            conn.execute("DELETE FROM scenes")
+            conn.commit()
+        print("Cleared 'scenes' table rows")
+
+    if os.path.exists(settings.SCENE_IMAGE_DIR):
+        for fname in os.listdir(settings.SCENE_IMAGE_DIR):
+            os.remove(os.path.join(settings.SCENE_IMAGE_DIR, fname))
+        print(f"Cleared saved photos in {settings.SCENE_IMAGE_DIR}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", required=True, help="Flat folder of location photos")
     parser.add_argument("--face-engine", default=settings.DEFAULT_ENGINE,
                          help="Which face engine to use just to confirm a person is present")
+    parser.add_argument("--reset", action="store_true",
+                         help="Wipe the existing scene gallery before repopulating")
     args = parser.parse_args()
+
+    if args.reset:
+        print("Resetting scene gallery...")
+        reset_gallery()
+        print()
 
     print(f"Loading face engine '{args.face_engine}' (for the person-presence gate)...")
     face_engine = get_engine(args.face_engine)

@@ -4,7 +4,7 @@ from pydantic import BaseModel
 class Settings(BaseModel):
     # Paths
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    DATA_DIR: str = os.path.join(BASE_DIR, "data")
+    DATA_DIR: str = "/content/drive/MyDrive/face_recognition_data"
     DB_PATH: str = os.path.join(DATA_DIR, "facestore.sqlite")
     FAISS_INDEX_PATH: str = os.path.join(DATA_DIR, "faiss_index.bin")
 

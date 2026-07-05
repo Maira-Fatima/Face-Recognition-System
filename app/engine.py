@@ -248,6 +248,20 @@ class SceneEngine:
         self.model.to(self.device).eval()
 
         self._transform = transforms.Compose([
+            transforms.Resize(256),        # resize shorter side to 256, keeps aspect ratio
+            transforms.CenterCrop(224),    # then crop the standard 224x224 square
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # A second, no-crop transform used only as one of several TTA views
+        # during search (see embed_multi_view). Squashing distorts a full
+        # building's proportions, which is why it is NOT used for the main
+        # gallery embed() -- but for an already-partial/cropped query photo,
+        # keeping the ENTIRE remaining content (instead of center-cropping
+        # away more of it) can occasionally recover a match the aspect-
+        # preserving crop would miss.
+        self._transform_full_frame = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -267,9 +281,19 @@ class SceneEngine:
 
         return masked
 
+    def _embed_pil(self, pil_image, transform):
+        """Runs one PIL image through DINOv2 with the given transform, returns a flat L2-normalized numpy embedding."""
+        tensor = transform(pil_image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            embedding = self.model(tensor)
+            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        return embedding.cpu().numpy().flatten().astype(np.float32)
+
     def embed(self, image_bgr: np.ndarray):
         """
         Masks out people, then embeds the remaining background with DINOv2.
+        Used for /insert and for building the gallery -- single, consistent
+        aspect-preserving view per photo.
 
         Args:
             image_bgr (np.ndarray): input image, BGR (same convention as
@@ -289,14 +313,58 @@ class SceneEngine:
         from PIL import Image
         rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb)
-        tensor = self._transform(pil_image).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            embedding = self.model(tensor)
-            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        embedding = self._embed_pil(pil_image, self._transform)
         embed_ms = (time.perf_counter() - start_embed) * 1000.0
 
-        embedding = embedding.cpu().numpy().flatten().astype(np.float32)
         return embedding, mask_ms, embed_ms
+
+    def embed_multi_view(self, image_bgr: np.ndarray):
+        """
+        Used for SEARCH only. Generates several embeddings of the SAME
+        photo under different crops/framings, so a partially-cropped or
+        tightly-framed query (e.g. half of a landmark cut off) still has
+        a chance to match a gallery photo that shows the full building --
+        rather than relying on a single fixed crop that might discard the
+        one distinctive part of the building still visible.
+
+        Views generated:
+            "standard"   - aspect-preserving resize + center crop (same as embed())
+            "full_frame" - resize the whole masked image to 224x224 without
+                            cropping, so no additional content is thrown away
+            "zoom"       - center-crop to 85% first, then aspect-preserving
+                            resize+crop, i.e. a slightly tighter framing
+
+        Returns:
+            tuple: (views, mask_ms, embed_ms)
+                views: list of {"variant": str, "embedding": np.ndarray}
+                mask_ms: float, time spent on person segmentation (shared across views).
+                embed_ms: float, TOTAL time spent embedding all views.
+        """
+        from PIL import Image
+
+        start_mask = time.perf_counter()
+        masked_bgr = self._mask_out_people(image_bgr)
+        mask_ms = (time.perf_counter() - start_mask) * 1000.0
+
+        rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
+        w, h = pil_image.size
+
+        views = []
+        start_embed = time.perf_counter()
+
+        views.append({"variant": "standard", "embedding": self._embed_pil(pil_image, self._transform)})
+        views.append({"variant": "full_frame", "embedding": self._embed_pil(pil_image, self._transform_full_frame)})
+
+        # 85% center crop -> slightly zoomed-in framing
+        crop_w, crop_h = int(w * 0.85), int(h * 0.85)
+        left, top = (w - crop_w) // 2, (h - crop_h) // 2
+        zoomed = pil_image.crop((left, top, left + crop_w, top + crop_h))
+        views.append({"variant": "zoom", "embedding": self._embed_pil(zoomed, self._transform)})
+
+        embed_ms = (time.perf_counter() - start_embed) * 1000.0
+
+        return views, mask_ms, embed_ms
 
 
 _scene_engine_singleton: "SceneEngine | None" = None
