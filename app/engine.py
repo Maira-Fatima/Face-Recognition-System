@@ -17,8 +17,10 @@ class BaseEngine(ABC):
     @abstractmethod
     def embed(self, image: np.ndarray):
         """
-        Detects a face and extracts an L2-normalized embedding.
-        
+        Detects a SINGLE face (the largest/most central one) and extracts
+        an L2-normalized embedding. Used for /insert, where a photo is
+        being enrolled under exactly one name.
+
         Args:
             image (np.ndarray): The input image (BGR format).
             
@@ -27,6 +29,26 @@ class BaseEngine(ABC):
                 embedding: np.ndarray of shape (1, embedding_dim) or None if no face detected.
                 detect_ms: float, time taken for detection in milliseconds.
                 embed_ms: float, time taken for embedding in milliseconds.
+        """
+        pass
+
+    @abstractmethod
+    def embed_all(self, image: np.ndarray):
+        """
+        Detects EVERY face in the image (no cap) and returns one embedding
+        per face. Used for /search, so a group photo doesn't get silently
+        reduced to a single face before recognition runs -- every person
+        present gets their own embedding searched independently.
+
+        Args:
+            image (np.ndarray): The input image (BGR format).
+
+        Returns:
+            tuple: (faces, detect_ms, embed_ms)
+                faces: list of dicts, one per detected face:
+                    {"embedding": np.ndarray, "bbox": [x1,y1,x2,y2], "confidence": float}
+                detect_ms: float, total detection time in milliseconds.
+                embed_ms: float, total embedding time in milliseconds (all faces).
         """
         pass
 
@@ -73,6 +95,40 @@ class ArcFaceEngine(BaseEngine):
         
         return embedding, detect_ms, embed_ms
 
+    def embed_all(self, image: np.ndarray):
+        start_det = time.perf_counter()
+        # max_num=0 -> no cap, return every face the detector finds
+        bboxes, kpss = self.det_model.detect(image, max_num=0, metric='default')
+        detect_ms = (time.perf_counter() - start_det) * 1000.0
+
+        faces_out = []
+
+        class FakeFace:
+            def __init__(self, bbox, kps, det_score):
+                self.bbox = bbox
+                self.kps = kps
+                self.det_score = det_score
+
+        start_embed = time.perf_counter()
+        for i in range(bboxes.shape[0]):
+            bbox = bboxes[i, 0:4]
+            det_score = bboxes[i, 4]
+            kps = kpss[i] if kpss is not None else None
+
+            face = FakeFace(bbox, kps, det_score)
+            self.rec_model.get(image, face)
+            embedding = face.embedding
+            embedding = embedding / np.linalg.norm(embedding)
+
+            faces_out.append({
+                "embedding": embedding,
+                "bbox": [float(v) for v in bbox],
+                "confidence": float(det_score),
+            })
+        embed_ms = (time.perf_counter() - start_embed) * 1000.0
+
+        return faces_out, detect_ms, embed_ms
+
 
 class _UniFaceEngineBase(BaseEngine):
     """
@@ -107,6 +163,26 @@ class _UniFaceEngineBase(BaseEngine):
         embedding = embedding / np.linalg.norm(embedding)
 
         return embedding, detect_ms, embed_ms
+
+    def embed_all(self, image: np.ndarray):
+        start_det = time.perf_counter()
+        faces = self.detector.detect(image)  # max_num=0 by default -> every face
+        detect_ms = (time.perf_counter() - start_det) * 1000.0
+
+        faces_out = []
+        start_embed = time.perf_counter()
+        for face in faces:
+            embedding = self.recognizer.get_normalized_embedding(image, face.landmarks)
+            embedding = embedding / np.linalg.norm(embedding)
+            bbox = face.bbox.tolist() if hasattr(face.bbox, "tolist") else list(face.bbox)
+            faces_out.append({
+                "embedding": embedding,
+                "bbox": [float(v) for v in bbox],
+                "confidence": float(face.confidence),
+            })
+        embed_ms = (time.perf_counter() - start_embed) * 1000.0
+
+        return faces_out, detect_ms, embed_ms
 
 
 class AdaFaceEngine(_UniFaceEngineBase):
