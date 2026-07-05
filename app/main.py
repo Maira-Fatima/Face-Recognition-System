@@ -1,9 +1,8 @@
 import os
 import uuid
-import base64
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
@@ -296,8 +295,9 @@ async def search_face_all_engines(
     }
 
 
-async def _run_scene_search(image: np.ndarray, top_k: int, face_check_engine: str) -> dict:
-    """Shared logic used by both /search_scene (JSON) and /search_scene_view (HTML)."""
+async def _run_scene_search(image: np.ndarray, top_k: int, face_check_engine: str, base_url: str) -> dict:
+    """Shared logic for /search_scene. base_url is used to turn each
+    match's relative image path into a full, directly-openable link."""
     if face_check_engine not in engines:
         raise HTTPException(
             status_code=400,
@@ -319,9 +319,12 @@ async def _run_scene_search(image: np.ndarray, top_k: int, face_check_engine: st
     )
     total_ms = (time.perf_counter() - start) * 1000.0
 
+    base_url = base_url.rstrip("/")
     for m in matches:
         filename = os.path.basename(m["image_path"])
-        m["image_url"] = f"/scene_images/{filename}"
+        # Full, directly-clickable URL -- no more manual prefixing needed
+        # to actually view the matched photo (e.g. in Swagger or a browser).
+        m["image_url"] = f"{base_url}/scene_images/{filename}"
 
     best_match = None
     if matches and matches[0]["similarity"] >= settings.SCENE_MATCH_THRESHOLD:
@@ -341,6 +344,7 @@ async def _run_scene_search(image: np.ndarray, top_k: int, face_check_engine: st
 
 @app.post("/search_scene")
 async def search_scene(
+    request: Request,
     file: UploadFile = File(...),
     top_k: int = Form(3),
     face_check_engine: str = Form(
@@ -355,74 +359,14 @@ async def search_scene(
     A face must still be detected in the query photo (same rule as
     /insert) -- but the actual MATCH is done purely on the background,
     ignoring who the person is. On a hit, returns the ORIGINAL stored
-    photo (via image_path / the /scene_images static URL), not a location
-    name -- there is no location label anywhere in this system.
+    photo as a full, directly-openable URL (via the /scene_images static
+    route), not a location name -- there is no location label anywhere
+    in this system.
     """
     try:
         image = await _process_image(file)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return await _run_scene_search(image, top_k, face_check_engine)
-
-
-@app.post("/search_scene_view", response_class=HTMLResponse)
-async def search_scene_view(
-    file: UploadFile = File(...),
-    top_k: int = Form(3),
-    face_check_engine: str = Form(default=settings.DEFAULT_ENGINE),
-):
-    """
-    Same as /search_scene, but renders the query photo and matched
-    database photo(s) side by side as an HTML page instead of raw JSON --
-    for quickly demoing/eyeballing results in a browser (e.g. via
-    Swagger's 'Try it out', which opens the response in a new tab for
-    HTML responses).
-    """
-    try:
-        image = await _process_image(file)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    result = await _run_scene_search(image, top_k, face_check_engine)
-
-    # Encode the uploaded query image as base64 so it can be shown inline
-    # without needing to save/serve it separately.
-    _, buf = cv2.imencode(".jpg", image)
-    query_b64 = base64.b64encode(buf).decode("utf-8")
-
-    def match_card(m: dict, label: str) -> str:
-        return f"""
-        <div style="display:inline-block; margin:12px; text-align:center;">
-            <img src="{m['image_url']}" style="max-width:320px; max-height:320px; border-radius:8px; border:2px solid #444;">
-            <p><b>{label}</b><br>similarity: {m['similarity']:.4f}<br>scene_id: {m['id']}</p>
-        </div>
-        """
-
-    matches_html = "".join(
-        match_card(m, "BEST MATCH" if result["best_match"] and m["id"] == result["best_match"]["id"] else "match")
-        for m in result["matches"]
-    ) or "<p>No matches found in the database.</p>"
-
-    status_html = (
-        "<p style='color:#4caf50; font-size:18px;'><b>✅ Location recognized in database</b></p>"
-        if result["location_recognized"]
-        else "<p style='color:#e53935; font-size:18px;'><b>❌ No matching location found (below threshold)</b></p>"
-    )
-
-    html = f"""
-    <html>
-    <body style="font-family: sans-serif; background:#111; color:#eee; padding:24px;">
-        <h2>Scene Search Result</h2>
-        {status_html}
-        <p>threshold: {result['match_threshold']}  |  total time: {result['total_ms']} ms</p>
-
-        <h3>Query photo</h3>
-        <img src="data:image/jpeg;base64,{query_b64}" style="max-width:320px; border-radius:8px; border:2px solid #444;">
-
-        <h3>Matches from database</h3>
-        {matches_html}
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
+    base_url = str(request.base_url)
+    return await _run_scene_search(image, top_k, face_check_engine, base_url)
